@@ -1,4 +1,36 @@
-venv/
+# Python
 __pycache__/
-.ipynb_checkpoints/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environment
+venv/
+.venv/
+
+# Environment variables
 .env
+.env.*
+
+# Data / Vector DB
+data/
+*.faiss
+*.pkl
+*.index
+
+# Jupyter Notebook
+*.ipynb
+.ipynb_checkpoints/
+
+# VS Code
+.vscode/
+
+# Logs
+logs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+config/
