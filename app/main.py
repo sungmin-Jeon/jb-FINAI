@@ -1,124 +1,197 @@
 # app/main.py
-
 import sys
 from pathlib import Path
 
+import requests
 import streamlit as st
-
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT_DIR))
 
-
-from server.retrieval.law.retriever import search_law_documents
-
-
-def render_sidebar():
-    st.sidebar.title("⚙️ 검색 설정")
-
-    k = st.sidebar.slider(
-        "검색할 조문 수",
-        min_value=1,
-        max_value=10,
-        value=5,
-    )
-
-    st.sidebar.markdown("---")
-    st.sidebar.caption("현재 버전: 법령 FAISS Retrieval 테스트")
-
-    return k
+from config.settings import settings
+from app.components.sidebar import render_sidebar
+from app.components.results import display_results
+from app.utils.state_manager import init_session_state
 
 
-def render_search_result(docs):
-    if not docs:
-        st.info("검색 결과가 없습니다.")
+API_URL        = "http://localhost:8000/api/v1/workflow/compliance"
+API_STREAM_URL = "http://localhost:8000/api/v1/workflow/compliance/stream"
+
+
+# ---------------------------------------------------------------------------
+# 분석 실행
+# ---------------------------------------------------------------------------
+
+def start_analysis():
+    input_text = st.session_state.input_text
+    k          = st.session_state.get("k", 3)
+
+    if not input_text.strip():
+        st.warning("검토할 텍스트를 입력해주세요.")
+        st.session_state.app_mode = "input"
         return
 
-    st.subheader("검색 결과")
+    payload = {
+        "input_text": input_text,
+        "k": k,
+    }
 
-    for i, doc in enumerate(docs, start=1):
-        metadata = doc.metadata
-
-        law_name = metadata.get("law_name", "")
-        article_no = metadata.get("article_no", "")
-        article_title = metadata.get("article_title", "")
-        chapter = metadata.get("chapter", "")
-        effective_date = metadata.get("law_effective_date", "")
-        chunk_id = metadata.get("chunk_id", "")
-
-        expander_title = f"{i}. {law_name} 제{article_no}조({article_title})"
-
-        with st.expander(expander_title, expanded=(i <= 2)):
-            col1, col2 = st.columns(2)
-
-            with col1:
-                st.markdown("#### 기본 정보")
-                st.write(f"**법령명:** {law_name}")
-                st.write(f"**조문:** 제{article_no}조")
-                st.write(f"**조문 제목:** {article_title}")
-
-            with col2:
-                st.markdown("#### 메타데이터")
-                st.write(f"**장:** {chapter}")
-                st.write(f"**시행일자:** {effective_date}")
-                st.write(f"**chunk_id:** `{chunk_id}`")
-
-            st.markdown("#### 조문 내용")
-            st.write(doc.page_content)
-
-
-def render_input(k: int):
-    st.markdown(
-        """
-        ### 법령 Retrieval 테스트
-
-        입력한 질문이나 문구와 관련 있는 금융 법령 조문을 검색합니다.
-
-        현재 흐름:
-
-        `법령 parsed_json → Document → FAISS VectorStore → Similarity Search`
-        """
-    )
-
-    query = st.text_area(
-        "질문 또는 검토할 문구를 입력하세요",
-        value="금융상품 판매자가 설명의무를 위반하면 어떤 문제가 있나?",
-        height=120,
-    )
-
-    if st.button("검색하기", type="primary"):
-        if not query.strip():
-            st.warning("질문을 입력해주세요.")
-            return
-
-        with st.spinner("관련 조문 검색 중..."):
-            docs = search_law_documents(
-                query=query,
-                k=k,
+    try:
+        with st.spinner("준법심사 에이전트 실행 중..."):
+            response = requests.post(
+                API_URL,
+                json=payload,
+                timeout=300,
             )
 
-        st.session_state["last_query"] = query
-        st.session_state["retrieved_docs"] = docs
+        response.raise_for_status()
 
+        data   = response.json()
+        result = data.get("result", data)
+
+        # State에서 필요한 값 꺼내서 저장
+        st.session_state.result   = {
+            "input_text":            result.get("input_text", input_text),
+            "content_type":          result.get("content_type", ""),
+            "product_type":          result.get("product_type", ""),
+            "rejection_probability": result.get("rejection_probability", ""),
+            "violation_articles":    result.get("violation_articles", []),
+            "rejection_reasons":     result.get("rejection_reasons", []),
+            "rewritten_text":        result.get("rewritten_text", ""),
+            "rewrite_reasons":       result.get("rewrite_reasons", ""),
+            "verification_passed":   result.get("verification_passed", False),
+            "verification_result":   result.get("verification_result", ""),
+            "original_risk_score":   result.get("original_risk_score", ""),
+            "rewritten_risk_score":  result.get("rewritten_risk_score", ""),
+            "risk_comparison":       result.get("risk_comparison", ""),
+            "law_context":           result.get("law_context", ""),
+            "report":                result.get("report", {}),
+        }
+        st.session_state.messages = result.get("messages", [])
+        st.session_state.app_mode = "results"
+
+        st.rerun()
+
+    except requests.exceptions.ConnectionError:
+        st.error(
+            "FastAPI 서버에 연결할 수 없습니다.\n"
+            "`uvicorn server.main:app --reload --host 0.0.0.0 --port 8000`을 먼저 실행하세요."
+        )
+        st.session_state.app_mode = "input"
+
+    except requests.exceptions.Timeout:
+        st.error("분석 시간이 초과됐습니다. 다시 시도해주세요.")
+        st.session_state.app_mode = "input"
+
+    except requests.exceptions.HTTPError as e:
+        st.error(f"API 요청 실패: {e}")
+        try:
+            st.json(response.json())
+        except Exception:
+            st.write(response.text)
+        st.session_state.app_mode = "input"
+
+    except Exception as e:
+        st.error(f"분석 중 오류가 발생했습니다: {e}")
+        st.session_state.app_mode = "input"
+
+
+# ---------------------------------------------------------------------------
+# 입력 화면
+# ---------------------------------------------------------------------------
+
+def render_input():
+    st.markdown("""
+    ### 준법자문 AI 에이전트
+
+    광고 문구, 상품설명서, 약관 문장을 입력하면  
+    금융소비자보호법 기반으로 준법 위반 가능성을 분석하고  
+    수정안과 준법팀 제출용 보고서를 생성합니다.
+    """)
+
+    st.text_area(
+        "검토할 텍스트를 입력하세요",
+        key="input_text",
+        height=150,
+        placeholder="예: 연 10% 확정 수익! 원금이 보장되는 안전한 투자 상품입니다.",
+    )
+
+    if st.button("검토 시작", type="primary", use_container_width=True):
+        if not st.session_state.input_text.strip():
+            st.warning("텍스트를 입력해주세요.")
+        else:
+            st.session_state.app_mode = "analysis"
+            st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# 진행 상황 표시
+# ---------------------------------------------------------------------------
+
+def render_progress():
+    messages = st.session_state.get("messages", [])
+
+    from server.workflow.state import NodeType
+
+    node_order = [
+        NodeType.TRIAGE,
+        NodeType.PREDICTION,
+        NodeType.TOOL_ROUTER,
+        NodeType.RETRIEVAL,
+        NodeType.JUDGMENT,
+        NodeType.REWRITE,
+        NodeType.VERIFICATION,
+        NodeType.COMPARATOR,
+        NodeType.REPORT,
+    ]
+
+    completed = {m["node"] for m in messages}
+
+    for node in node_order:
+        label = NodeType.to_korean(node)
+        if node in completed:
+            st.success(f"✅ {label}")
+        else:
+            st.info(f"⏳ {label}")
+
+
+# ---------------------------------------------------------------------------
+# 메인 UI
+# ---------------------------------------------------------------------------
 
 def render_ui():
     st.set_page_config(
-        page_title="Compliance Law Retrieval",
+        page_title="준법자문 AI 에이전트",
         page_icon="⚖️",
         layout="wide",
     )
 
-    st.title("⚖️ Compliance Law Retrieval")
+    st.title("⚖️ 준법자문 AI 에이전트")
 
-    k = render_sidebar()
+    if not settings.OPENAI_API_KEY:
+        st.error("OPENAI_API_KEY가 설정되지 않았습니다.")
+        return
 
-    render_input(k)
+    render_sidebar()
 
-    if "retrieved_docs" in st.session_state:
-        st.markdown("---")
-        st.caption(f"최근 검색어: {st.session_state.get('last_query', '')}")
-        render_search_result(st.session_state["retrieved_docs"])
+    current_mode = st.session_state.app_mode
+
+    if current_mode == "input":
+        render_input()
+
+    elif current_mode == "analysis":
+        start_analysis()
+
+    elif current_mode == "results":
+        # 진행 메시지 사이드바에 표시
+        with st.sidebar:
+            st.divider()
+            st.markdown("**처리 단계**")
+            render_progress()
+
+        display_results()
 
 
 if __name__ == "__main__":
+    init_session_state()
     render_ui()

@@ -1,16 +1,11 @@
-# server/retrieval/law/retriever.py
+# server/retrieval/law/simple_retriever.py
 """
-준법심사 AI 에이전트를 위한 법령 검색 모듈.
+MVP 단계 법령 검색 모듈.
 
-주요 기능:
-    1. 입력 텍스트에서 법적 쟁점 추출 (LLM)
-    2. 쟁점별 멀티쿼리 검색 (MultiQueryRetriever)
-    3. 결과 합치기 + 중복 제거
-    4. 검색 결과 포매팅
+쟁점 추출 + 쟁점별 similarity_search + 중복 제거 방식.
+MultiQueryRetriever 없이 단순하게 구현한다.
 
-사용 예시:
-    retriever = LawRetriever(vectorstore=vs, llm=llm)
-    docs = retriever.retrieve("연 10% 확정 수익 원금 보장 상품")
+복잡한 버전은 retriever.py 참고.
 """
 
 from __future__ import annotations
@@ -18,10 +13,9 @@ from __future__ import annotations
 import logging
 from typing import List
 
-from langchain_classic.retrievers.multi_query import MultiQueryRetriever
+from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 from langchain_core.language_models import BaseLanguageModel
-from langchain_community.vectorstores import FAISS
 from langchain_core.prompts import PromptTemplate
 
 
@@ -50,23 +44,23 @@ ISSUE_EXTRACTION_PROMPT = PromptTemplate.from_template("""
 
 
 # ---------------------------------------------------------------------------
-# LawRetriever
+# SimpleRetriever
 # ---------------------------------------------------------------------------
 
-class LawRetriever:
+class SimpleRetriever:
     """
-    준법심사를 위한 법령 검색기.
-
-    쟁점 추출 → 쟁점별 멀티쿼리 검색 → 중복 제거 순서로 동작한다.
+    쟁점 추출 + similarity_search 기반 법령 검색기.
 
     Parameters
     ----------
     vectorstore : FAISS
         로드된 FAISS 벡터스토어
     llm : BaseLanguageModel
-        쟁점 추출 및 멀티쿼리 생성에 사용할 LLM
+        쟁점 추출에 사용할 LLM
     k : int
         쟁점별 검색 결과 수 (기본 3)
+    max_docs : int
+        최종 반환할 최대 Document 수 (기본 10)
     """
 
     def __init__(
@@ -74,10 +68,12 @@ class LawRetriever:
         vectorstore: FAISS,
         llm: BaseLanguageModel,
         k: int = 3,
+        max_docs: int = 10,
     ) -> None:
         self.vectorstore = vectorstore
         self.llm         = llm
         self.k           = k
+        self.max_docs    = max_docs
 
     # -----------------------------------------------------------------------
     # 퍼블릭 API
@@ -97,7 +93,7 @@ class LawRetriever:
         list[Document]
             중복 제거된 관련 법령 Document 목록
         """
-        issues = self._extract_issues(text)
+        issues = self.extract_issues(text)
         logger.info(f"추출된 쟁점 {len(issues)}개: {issues}")
 
         docs = self._search_by_issues(issues)
@@ -106,16 +102,8 @@ class LawRetriever:
         return docs
 
     def extract_issues(self, text: str) -> list[str]:
-        """쟁점만 추출해서 반환한다. (외부에서 쟁점 확인용)"""
-        return self._extract_issues(text)
-
-    # -----------------------------------------------------------------------
-    # 내부 메서드
-    # -----------------------------------------------------------------------
-
-    def _extract_issues(self, text: str) -> list[str]:
         """LLM으로 법적 쟁점을 추출한다."""
-        prompt = ISSUE_EXTRACTION_PROMPT.format(text=text)
+        prompt  = ISSUE_EXTRACTION_PROMPT.format(text=text)
         response = self.llm.invoke(prompt)
 
         content = response.content if hasattr(response, "content") else str(response)
@@ -128,26 +116,20 @@ class LawRetriever:
 
         return issues
 
+    # -----------------------------------------------------------------------
+    # 내부 메서드
+    # -----------------------------------------------------------------------
+
     def _search_by_issues(self, issues: list[str]) -> list[Document]:
         """
-        쟁점별로 MultiQueryRetriever로 검색하고 중복 제거한다.
-
-        각 쟁점당 MultiQueryRetriever가 LLM으로 유사 쿼리를 생성하여
-        검색 커버리지를 높인다.
+        쟁점별로 similarity_search를 수행하고 중복 제거한다.
         """
-        multi_query_retriever = MultiQueryRetriever.from_llm(
-            retriever=self.vectorstore.as_retriever(
-                search_kwargs={"k": self.k},
-            ),
-            llm=self.llm,
-        )
-
-        seen     = set()
-        results  = []
+        seen    = set()
+        results = []
 
         for issue in issues:
             try:
-                docs = multi_query_retriever.invoke(issue)
+                docs = self.vectorstore.similarity_search(issue, k=self.k)
                 for doc in docs:
                     chunk_id = doc.metadata.get("chunk_id", "")
                     if chunk_id and chunk_id not in seen:
@@ -157,7 +139,7 @@ class LawRetriever:
                 logger.warning(f"쟁점 검색 실패 ({issue}): {e}")
                 continue
 
-        return results
+        return results[:self.max_docs]
 
 
 # ---------------------------------------------------------------------------
@@ -181,10 +163,8 @@ def format_retrieved_docs(docs: List[Document]) -> str:
         chunk_level = meta.get("chunk_level", "article")
         source_name = meta.get("source_name", "")
 
-        # 헤더
         header = f"[근거 {i + 1}]"
 
-        # 출처 정보
         if chunk_level == "byeolpyo":
             ref = (
                 f"출처: {source_name} "
