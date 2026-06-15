@@ -3,6 +3,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from server.routers.compliance import router as compliance_router
+from server.workflow.graph import create_compliance_graph
 
 app = FastAPI(
     title="준법자문 AI 에이전트",
@@ -19,6 +20,11 @@ app.add_middleware(
 )
 
 app.include_router(compliance_router)
+
+
+@app.on_event("startup")
+def startup():
+    app.state.graph = create_compliance_graph(k=3)
 
 
 @app.get("/")

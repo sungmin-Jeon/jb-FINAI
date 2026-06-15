@@ -35,7 +35,7 @@ from langchain_core.prompts import PromptTemplate                               
 
 from config.settings import get_embeddings, get_llm                                      # noqa: E402
 from server.retrieval.vector_store import load_vector_store                              # noqa: E402
-from server.retrieval.law.simple_retriever import SimpleRetriever, format_retrieved_docs # noqa: E402
+from archive.law.simple_retriever import SimpleRetriever, format_retrieved_docs # noqa: E402
 
 
 # ---------------------------------------------------------------------------

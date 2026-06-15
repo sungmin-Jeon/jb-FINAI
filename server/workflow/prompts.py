@@ -1,9 +1,65 @@
 # server/workflow/prompts.py
 """
 준법심사 AI 에이전트 프롬프트 모음.
+
+핵심 설계:
+1. 검색된 법령 = 참고 근거이지, 곧바로 위반 근거가 아님
+2. 안전 고지가 이미 포함된 문구는 기본적으로 낮음 판단 가능
+3. 위반 가능 사항과 추가 확인 필요 사항을 분리
+4. 낮음이면 수정안 생성 없이 보고서만 생성
+5. LLM이 원문에 없는 사실/절차/수치/제공 여부를 만들어내지 않도록 제한
+6. KG 탐색 결과를 판단 근거로 우선 활용
 """
 
 from langchain_core.prompts import PromptTemplate
+
+
+# ---------------------------------------------------------------------------
+# 0. Orchestrator
+# ---------------------------------------------------------------------------
+
+ORCHESTRATOR_PROMPT = PromptTemplate.from_template("""당신은 금융 준법심사 AI 에이전트의 오케스트레이터입니다.
+사용자 입력을 분석하여 적절한 워크플로우를 선택하세요.
+
+[입력]
+{input_text}
+
+[워크플로우 유형]
+- review: 광고문구, 상품설명서, 약관 등 준법 검토 요청
+  예: "이 문구 검토해줘", "광고 문구입니다", 실제 금융 광고/문서 텍스트
+
+- qa: 금융 법령, 규정, 준법 관련 질문
+  예: "금소법 21조가 뭐야?", "원금보장 표현이 왜 문제야?", "~하면 법 위반인가요?"
+
+[규칙]
+- 실제 광고문구나 금융 문서처럼 보이면 review
+- 질문형이면 qa
+- 애매하면 review
+
+JSON만 응답:
+{{"workflow_type": "review" | "qa"}}""")
+
+
+# ---------------------------------------------------------------------------
+# 0-1. QA
+# ---------------------------------------------------------------------------
+
+QA_PROMPT = PromptTemplate.from_template("""당신은 금융소비자보호법 전문가입니다.
+아래 질문에 법령 근거를 포함하여 답변하세요.
+
+[질문]
+{input_text}
+
+[관련 법령]
+{law_context}
+
+[답변 원칙]
+1. 관련 법령을 근거로 정확하게 답변하세요.
+2. 법령에 없는 내용은 만들어내지 마세요.
+3. 핵심을 간결하게 설명하세요.
+4. 실무적으로 도움이 되는 내용을 포함하세요.
+
+답변:""")
 
 
 # ---------------------------------------------------------------------------
@@ -12,48 +68,62 @@ from langchain_core.prompts import PromptTemplate
 
 TRIAGE_PROMPT = PromptTemplate.from_template("""
 당신은 금융소비자보호법 전문 준법심사 전문가입니다.
-아래 텍스트를 분석하여 콘텐츠 유형을 파악하세요.
+아래 텍스트를 분석하여 콘텐츠 유형과 상품 유형을 분류하세요.
 
 [입력 텍스트]
 {input_text}
 
-[지시사항]
+[분류 원칙]
+1. 짧은 홍보 문구, 배너 문구, 이벤트 문구, 수익률/금리/혜택을 강조하는 문구는 advertisement로 분류하세요.
+2. 광고나 상품설명서 일부에 들어가는 짧은 안내/고지 문구는 short_notice로 분류하세요.
+3. 상품 구조, 투자대상, 수수료, 위험등급, 환매조건, 운용방식, 손실 가능성 등 여러 항목을 체계적으로 설명하는 긴 문서만 product_description으로 분류하세요.
+4. 계약 조건, 권리/의무, 해지, 면책, 분쟁처리 등 약관성 내용이 중심이면 terms로 분류하세요.
+5. 단순히 "상품설명서와 약관을 확인하세요"라는 문장이 포함되어 있다고 해서 product_description으로 분류하지 마세요.
+6. 판단이 어려우면 unknown으로 분류하세요.
+
+[content_type 기준]
+- advertisement: 광고 문구, 홍보 문구, 배너 문구, 이벤트 문구
+- short_notice: 짧은 안내 문구, 위험 고지 문구, 설명서/약관 확인 안내 문구
+- product_description: 상품설명서 수준의 상세 설명 문서
+- terms: 약관, 계약 조건, 권리/의무 관련 문서
+- unknown: 판단 불가
+
+[product_type 기준]
+- investment: 투자성 상품, 펀드, ELS, ETF, 신탁, 투자일임 등
+- loan: 대출성 상품, 신용대출, 주택담보대출 등
+- insurance: 보험성 상품, 생명보험, 손해보험 등
+- deposit: 예금성 상품, 예금, 적금 등
+- unknown: 판단 불가
+
+[review_focus 기준]
+- advertisement: 광고 규제, 금지 표현, 필수 고지 사항
+- short_notice: 위험 고지 적정성, 오인 가능성, 추가 확인 필요 사항
+- product_description: 설명의무, 적합성/적정성 원칙, 중요사항 설명
+- terms: 불공정약관, 소비자 권리 침해, 계약상 불이익
+
+[출력 형식]
 아래 JSON 형식으로만 응답하세요. 다른 텍스트는 절대 포함하지 마세요.
 
 {{
-    "content_type": "advertisement | product_description | terms | unknown",
+    "content_type": "advertisement | short_notice | product_description | terms | unknown",
     "product_type": "investment | loan | insurance | deposit | unknown",
     "review_focus": ["검색에 사용할 핵심 규제 키워드 3개 이내"]
 }}
-
-content_type 기준:
-- advertisement: 광고 문구 (짧고 홍보성, 수익률/금리 강조)
-- product_description: 상품설명서 (상품 내용, 조건, 위험 설명)
-- terms: 약관 (계약 조건, 권리/의무)
-- unknown: 판단 불가
-
-product_type 기준:
-- investment: 투자성 상품 (펀드, ELS, ETF 등)
-- loan: 대출성 상품 (신용대출, 주담대 등)
-- insurance: 보장성 상품 (생명보험, 손해보험 등)
-- deposit: 예금성 상품 (예금, 적금 등)
-
-review_focus 기준 (content_type별):
-- advertisement: 광고 규제, 금지 표현, 필수 고지 사항
-- product_description: 설명의무, 적합성/적정성 원칙
-- terms: 불공정약관, 소비자 권리 침해
 
 JSON만 응답:
 """)
 
 
 # ---------------------------------------------------------------------------
-# 2. Rejection Prediction Agent
+# 2. Expression / Risk Prediction Agent
 # ---------------------------------------------------------------------------
 
 PREDICTION_PROMPT = PromptTemplate.from_template("""
 당신은 금융소비자보호법 전문 준법심사 전문가입니다.
-아래 텍스트에서 준법심사 반려 가능성이 있는 법적 쟁점을 추출하세요.
+
+아래 텍스트에서 준법 검토에 필요한 표현을 분석하세요.
+이 단계의 목적은 최종 위반 판단이 아니라, 입력 문구에 실제로 존재하는
+위험 표현(risk_expressions)과 안전 고지 표현(safe_expressions)을 추출하는 것입니다.
 
 [입력 텍스트]
 {input_text}
@@ -63,15 +133,169 @@ PREDICTION_PROMPT = PromptTemplate.from_template("""
 - 상품 유형: {product_type}
 - 검토 중점: {review_focus}
 
-[지시사항]
-- 위 콘텐츠 유형과 검토 중점을 반드시 고려하세요.
-- 각 쟁점은 법령 검색에 사용될 짧은 쿼리 형태로 작성하세요.
-- 쟁점은 최대 5개까지 추출하세요.
-- 각 쟁점을 한 줄씩 작성하세요. 번호나 기호 없이 텍스트만 작성하세요.
+[Knowledge Graph 탐색 결과]
+{kg_context}
 
-[쟁점 목록]
+[핵심 원칙]
+1. 입력 텍스트에 실제로 존재하는 표현만 추출하세요.
+2. risk_type을 바로 확정하지 마세요. 먼저 실제 문구에 있는 risk_expression과 safe_expression을 구분하세요.
+3. 위험 표현은 소비자가 오인할 수 있는 단정적/과장적/보장적 표현입니다.
+4. 안전 고지 표현은 위험을 완화하거나 조건·제한·변동 가능성을 안내하는 표현입니다.
+5. Knowledge Graph 결과는 참고 정보일 뿐입니다. KG에 조항이 있다고 해서 입력 문구에 없는 위험 표현을 새로 만들지 마세요.
+6. 쟁점은 최대 5개, risk_expressions는 최대 5개, safe_expressions는 최대 5개까지 추출하세요.
+7. 애매하면 risk_expression으로 단정하지 말고 safe_expression 또는 additional 확인 쟁점 후보로 보세요.
+
+[중요 구분]
+아래 표현들은 위험 표현이 아니라 안전 고지 표현입니다.
+
+- "해약환급금은 납입한 보험료보다 적거나 없을 수 있습니다"
+  → refund_condition_notice_present
+
+- "보장 범위와 면책사항은 상품설명서 및 약관에 따라 달라질 수 있습니다"
+  → coverage_limit_notice_present
+
+- "약관에서 정한 보험금 지급 사유에 해당하는 경우 보험금을 지급합니다"
+  → coverage_limit_notice_present 또는 terms_and_conditions_notice_present
+
+- "연령, 직업, 건강상태 및 회사의 인수 기준에 따라 가입이 제한되거나 보험료가 달라질 수 있습니다"
+  → eligibility_condition_notice_present 또는 premium_variability_notice_present
+
+- "상품설명서와 약관을 확인하시기 바랍니다"
+  → terms_and_conditions_notice_present
+
+반대로 아래 표현들은 위험 표현입니다.
+
+- "해약 시에도 납입한 보험료를 돌려받을 수 있습니다"
+  → refund_guarantee_expression
+
+- "해약 시 원금 보장", "납입보험료 전액 환급", "무조건 환급"
+  → refund_guarantee_expression
+
+- "모든 질병 보장", "제한 없이 보장", "100% 보장"
+  → coverage_unlimited_expression
+
+- "원금 보장", "원금 손실 없음", "손실 없이 투자"
+  → principal_guarantee_expression
+
+- "연 10% 확정 수익", "수익 보장", "확정 수익"
+  → return_guarantee_expression
+
+- "누구나 승인", "무조건 승인", "100% 승인"
+  → approval_guarantee_expression
+
+- "수수료 없음", "무료", "부담 없음"
+  → fee_free_expression
+
+- "전원 혜택", "무조건 지급", "100% 혜택"
+  → benefit_guarantee_expression
+
+- "업계 최고", "1위", "최저", "최고 수준"
+  → comparison_superiority_expression
+
+[RiskExpression 후보]
+아래 id 중에서만 사용하세요.
+
+- principal_guarantee_expression
+- return_guarantee_expression
+- performance_exaggeration_expression
+- refund_guarantee_expression
+- coverage_unlimited_expression
+- benefit_guarantee_expression
+- approval_guarantee_expression
+- fee_free_expression
+- comparison_superiority_expression
+
+[SafeExpression 후보]
+아래 id 중에서만 사용하세요.
+
+- refund_condition_notice_present
+- coverage_limit_notice_present
+- eligibility_condition_notice_present
+- premium_variability_notice_present
+- terms_and_conditions_notice_present
+- loss_risk_notice_present
+- future_return_not_guaranteed_notice_present
+- return_variability_notice_present
+- interest_rate_variability_notice_present
+- approval_condition_notice_present
+- fee_condition_notice_present
+
+[candidate_risk_types 후보]
+candidate_risk_types는 risk_expressions에서 유추되는 잠재 위험유형입니다.
+아래 후보 중에서만 사용하세요.
+단, safe_expression으로 이미 완화되는 위험은 candidate로 넣어도 되지만, 최종 확정은 RiskPolicyEngine이 처리합니다.
+
+- principal_loss_misleading
+- refund_misleading
+- return_guarantee_misleading
+- coverage_overstatement
+- approval_overstatement
+- cost_omission
+- condition_omission
+- risk_omission
+- comparison_exaggeration
+- benefit_overstatement
+- performance_exaggeration
+
+[상품유형별 주의]
+1. product_type이 insurance인 일반 보장성 보험 문구에서는 투자성 상품의 원금손실/수익률 관련 위험을 함부로 만들지 마세요.
+2. 보험에서 "해약환급금이 납입보험료보다 적거나 없을 수 있음"은 위험 표현이 아니라 안전 고지입니다.
+3. 보험에서 "납입한 보험료를 돌려받을 수 있음", "전액 환급", "해약 시 원금 보장"은 해약환급금 오인 위험 표현입니다.
+4. 보험에서 "가입이 제한될 수 있음", "보험료가 달라질 수 있음", "약관에 따라 달라질 수 있음"은 조건 누락이 아니라 조건 고지입니다.
+5. 변액보험, 투자연계보험, 운용실적연동형 보험이라는 단서가 명시된 경우에만 투자성 위험 표현을 고려하세요.
+
+[검색 쿼리 생성 원칙]
+1. 검색 쿼리는 법령 원문 검색에 사용할 수 있도록 짧고 구체적으로 작성하세요.
+2. risk_expression이 있으면 해당 위험 표현 중심으로 쿼리를 만드세요.
+3. safe_expression만 있고 위험 표현이 없으면 상품유형의 기본 고지/설명의무 확인용 쿼리를 1개 생성하세요.
+4. 쿼리는 최대 5개까지 생성하세요.
+
+[출력 형식]
+아래 JSON 형식으로만 응답하세요. 다른 텍스트는 절대 포함하지 마세요.
+
+{{
+    "issues": ["검토 쟁점 후보1", "검토 쟁점 후보2"],
+    "risk_expressions": [
+        {{
+            "id": "refund_guarantee_expression",
+            "label": "해약환급금 반환 보장 표현",
+            "evidence_text": "납입한 보험료를 돌려받을 수 있어",
+            "maps_to": ["refund_misleading"],
+            "confidence": "high"
+        }}
+    ],
+    "safe_expressions": [
+        {{
+            "id": "eligibility_condition_notice_present",
+            "label": "가입 조건 및 보험료 변동 가능성 고지",
+            "evidence_text": "가입이 제한되거나 보험료가 달라질 수 있습니다",
+            "mitigates": ["condition_omission"],
+            "confidence": "high"
+        }}
+    ],
+    "candidate_risk_types": ["refund_misleading"],
+    "search_queries": ["보험 해약환급금 오인 광고 고지"]
+}}
+
+[안전 고지만 있는 경우 예시]
+{{
+    "issues": [],
+    "risk_expressions": [],
+    "safe_expressions": [
+        {{
+            "id": "eligibility_condition_notice_present",
+            "label": "가입 조건 및 보험료 변동 가능성 고지",
+            "evidence_text": "가입이 제한되거나 보험료가 달라질 수 있습니다",
+            "mitigates": ["condition_omission"],
+            "confidence": "high"
+        }}
+    ],
+    "candidate_risk_types": [],
+    "search_queries": ["보험 가입 조건 인수 기준 고지 설명의무"]
+}}
+
+JSON만 응답:
 """)
-
 
 # ---------------------------------------------------------------------------
 # 3. Tool Router Agent
@@ -88,10 +312,16 @@ TOOL_ROUTER_PROMPT = PromptTemplate.from_template("""
 [법적 쟁점 목록]
 {issues}
 
-[지시사항]
-각 쟁점에 대해 법령 검색에 사용할 구체적인 쿼리를 생성하세요.
-쿼리는 법령 조문에서 찾을 수 있는 키워드 중심으로 작성하세요.
-각 쿼리를 한 줄씩 작성하세요. 번호나 기호 없이 텍스트만 작성하세요.
+[Knowledge Graph 탐색 결과]
+{kg_context}
+
+[검색 쿼리 생성 원칙]
+1. 각 쟁점에 대해 법령 검색에 사용할 구체적인 쿼리를 생성하세요.
+2. Knowledge Graph에서 확정된 조문이 있다면 해당 조문명을 쿼리에 포함하세요.
+3. 쿼리는 법령 조문에서 찾을 수 있는 키워드 중심으로 작성하세요.
+4. "명백한 반려 쟁점 없음"인 경우에도 최소한의 확인을 위해 관련 광고/설명의무/위험고지 쿼리를 생성할 수 있습니다.
+5. "추가 확인 필요" 항목은 위반 단정이 아니라 확인용 쿼리로 작성하세요.
+6. 각 쿼리를 한 줄씩 작성하세요. 번호나 기호 없이 텍스트만 작성하세요.
 
 [검색 쿼리 목록]
 """)
@@ -115,18 +345,63 @@ JUDGMENT_PROMPT = PromptTemplate.from_template("""
 [추출된 법적 쟁점]
 {issues}
 
-[관련 법령]
+[Knowledge Graph 탐색 결과] ← 구조화된 지식 기반 근거 (우선 활용)
+{kg_context}
+
+[관련 법령 원문] ← RAG 검색 결과 (세부 내용 확인용)
 {law_context}
 
-[판단 지시사항]
-반드시 위의 관련 법령에 있는 조문만 근거로 사용하세요.
+[판단 원칙]
+1. [Knowledge Graph 탐색 결과]를 판단의 1차 참고 근거로 활용하세요.
+   - 1차 KG의 "핵심 위반 가능 조문"은 우선 검토하되, 입력 문구에 실제 위험 표현이 있어야 violation_articles에 포함하세요.
+   - 1차 KG의 "위험유형"은 입력 문구 해석을 돕는 seed이며, 그 자체가 위반 확정 근거는 아닙니다.
+   - 1차 KG의 "필요 고지사항"은 상품유형과 입력 문구에 실제로 관련되는 경우에만 rejection_reasons 또는 additional_checks에 반영하세요.
+   - 상품유형과 맞지 않는 필요 고지사항은 출력하지 마세요.
+2. 2차 KG Expansion 결과는 검색된 조문과 연결된 보조 조문, 하위 규정, 추가 고지사항입니다.
+   - 2차 KG 확장 조문을 곧바로 위반 확정 조항으로 단정하지 마세요.
+   - 2차 KG 확장 조문은 판단 보강 또는 추가 확인 필요 사항으로 활용하세요.
+3. 상품유형 참고 조항은 해당 상품군과 관련된 참고 정보입니다.
+   - 상품유형 참고 조항만으로 위반을 단정하지 마세요.
+4. [관련 법령 원문]은 KG 결과를 보완하는 세부 근거로 활용하세요.
+5. 입력 텍스트에 실제로 문제가 확인되는 경우에만 violation_articles와 rejection_reasons를 작성하세요.
+6. 입력 텍스트만으로 충분성 여부를 확인할 수 없는 사항은 additional_checks에 작성하세요.
+7. "부족하다", "제공하지 않았다"처럼 단정하려면 입력 텍스트에 해당 정보가 명백히 없어야 합니다.
+8. 입력 텍스트에 이미 아래 안전 고지가 포함되어 있고, 명백한 위험 표현이 없다면 반려 가능성은 기본적으로 "낮음"으로 판단하세요.
+   - 투자성 상품의 원금 손실 가능성
+   - 보험 해약환급금이 납입보험료보다 적거나 없을 수 있다는 고지
+   - 과거 수익률이 미래 수익을 보장하지 않는다는 고지
+   - 상품설명서/약관 확인 안내
+9. product_type이 insurance이고 일반 보장성 보험 문구인 경우, 아래 고지는 일반적으로 요구하지 마세요.
+   - 수익률 변동 고지
+   - 금융투자상품 운용 손실 고지
+   - 투자성과/운용성과 관련 고지
+   단, 변액보험, 투자연계보험, 운용실적연동형 보험이라는 단서가 입력 텍스트에 명시된 경우에는 예외입니다.
+10. 아래 표현이 명확히 포함된 경우에는 반려 가능성을 "높음"으로 판단하세요.
+   - 확정 수익 / 원금 보장 / 무위험 / 손실 없음
+   - 안전한 투자라고 단정 / 누구나 고수익 가능
+   - 최고 수익 보장 / 절대 손해 없음
+   - 누구나 승인 / 100% 승인 / 조건 없이 보장
+   - 보험에서 해약 시 원금 보장, 납입보험료 전액 환급, 무조건 환급
+11. 반려 가능성이 "낮음"이면 need_rewrite는 false로 설정하고, violation_articles와 rejection_reasons는 빈 배열로 두세요.
+12. 반려 가능성이 "보통" 또는 "높음"인 경우에만 need_rewrite를 true로 설정하세요.
+13. 위반 가능 조항은 [Knowledge Graph 탐색 결과] 또는 [관련 법령 원문]에 실제로 포함된 조항만 사용하세요.
+14. additional_checks는 위반 사유가 아닙니다. "추가 확인 필요 사항"으로만 작성하세요.
 
-아래 JSON 형식으로만 응답하세요.
+[위험도 기준]
+- 높음: 확정수익, 원금보장, 무위험, 손실 없음, 누구나 승인, 보험료 전액 환급 보장 등 명백한 금지/오인 표현이 있는 경우
+- 보통: 일부 오인 가능성이 있으나 직접적인 단정 표현은 약한 경우
+- 낮음: 투자성 상품의 원금 손실 가능성, 보험 해약환급금이 납입보험료보다 적거나 없을 수 있다는 고지, 미래 수익 비보장, 설명서/약관 확인 등 안전 고지가 포함되어 있고 명백한 위험 표현이 없는 경우
+
+[출력 형식]
+아래 JSON 형식으로만 응답하세요. 다른 텍스트는 절대 포함하지 마세요.
 
 {{
     "rejection_probability": "높음 | 보통 | 낮음",
     "violation_articles": ["위반 가능 조항1", "위반 가능 조항2"],
-    "rejection_reasons": ["반려 예상 사유1", "반려 예상 사유2"]
+    "rejection_reasons": ["반려 예상 사유1", "반려 예상 사유2"],
+    "safe_factors": ["원문에 포함된 안전 요소1", "원문에 포함된 안전 요소2"],
+    "additional_checks": ["입력만으로 확인 불가하여 추가 확인이 필요한 사항1"],
+    "need_rewrite": true
 }}
 
 JSON만 응답:
@@ -150,19 +425,34 @@ REWRITE_PROMPT = PromptTemplate.from_template("""
 [반려 예상 사유]
 {rejection_reasons}
 
+[필요 고지사항] ← KG 기반 확정 고지 목록
+{kg_required_disclosures}
+
 [관련 법령]
 {law_context}
 
 [수정 지시사항]
-- 위반 표현을 법령 기준에 맞게 수정하세요.
-- 원문의 마케팅 의도를 최대한 유지하면서 수정하세요.
-- 수정 후에도 소비자가 이해할 수 있는 표현을 사용하세요.
+1. 위반 표현이 실제로 존재하는 경우에만 수정하세요.
+2. [필요 고지사항]에 있는 고지가 원문에 없더라도, 상품유형과 원문 내용에 실제로 관련되는 경우에만 수정안에 포함하세요.
+3. 상품유형과 맞지 않는 고지사항은 추가하지 마세요.
+   - 일반 보장성 보험에는 수익률 변동, 금융투자상품 운용 손실, 투자성과 관련 문구를 추가하지 마세요.
+   - 단, 변액보험/투자연계보험/운용실적연동형 보험이 원문에 명시된 경우에는 예외입니다.
+4. 원문의 마케팅 의도와 상품 구조를 최대한 유지하면서 수정하세요.
+5. 수정 후에도 소비자가 이해할 수 있는 표현을 사용하세요.
+6. 원문에 없는 사실, 수치, 절차, 제공 여부, 상품 구조를 새로 만들어내지 마세요.
+7. "제공하였습니다", "확인하였습니다", "충족하였습니다"처럼 실제 수행 여부를 단정하지 마세요.
+8. 정보가 부족한 경우에는 "확인하시기 바랍니다", "별도 확인이 필요합니다"처럼 안내형 표현을 사용하세요.
+9. 위반 가능 조항과 반려 예상 사유가 비어 있거나, 수정이 필요하지 않은 경우에는 "필수 수정안 없음"이라고 응답하세요.
+10. 수익률 표현을 수정할 때는 확정성, 보장성, 무위험성을 제거하고 손실 가능성 및 미래 수익 비보장을 함께 안내하세요.
+11. 투자성 상품의 원금 관련 표현을 수정할 때는 원금 손실 가능성이 있음을 명확히 안내하세요.
+12. 보험의 해약환급금 관련 표현을 수정할 때는 "해약환급금이 이미 납입한 보험료보다 적거나 없을 수 있습니다" 수준으로 안내하고, 원문에 없는 투자 운용 손실 문구는 추가하지 마세요.
 
-아래 JSON 형식으로만 응답하세요.
+[출력 형식]
+아래 JSON 형식으로만 응답하세요. 다른 텍스트는 절대 포함하지 마세요.
 
 {{
-    "rewritten_text": "수정된 텍스트",
-    "rewrite_reasons": "수정 이유 설명"
+    "rewritten_text": "수정된 텍스트 또는 필수 수정안 없음",
+    "rewrite_reasons": "수정 이유 설명 또는 수정 불필요 사유"
 }}
 
 JSON만 응답:
@@ -186,17 +476,26 @@ VERIFICATION_PROMPT = PromptTemplate.from_template("""
 [원래 반려 사유]
 {rejection_reasons}
 
+[필요 고지사항] ← KG 기반 확정 고지 목록
+{kg_required_disclosures}
+
 [관련 법령]
 {law_context}
 
 [검증 지시사항]
-- 원래 반려 사유가 수정안에서 해결됐는지 확인하세요.
-- 새로운 위험 표현이 생기지 않았는지 확인하세요.
+1. 원래 반려 사유가 수정안에서 해결됐는지 확인하세요.
+2. [필요 고지사항]이 수정안에 포함됐는지 확인하되, 상품유형과 맞지 않는 고지사항까지 요구하지 마세요.
+3. 새로운 위험 표현이나 원문에 없던 상품 구조가 생기지 않았는지 확인하세요.
+4. 수정안이 원문에 없는 사실, 수치, 절차, 제공 여부, 상품 구조를 단정하고 있지는 않은지 확인하세요.
+5. 일반 보장성 보험 수정안에 수익률 변동, 금융투자상품 운용 손실, 투자성과 관련 문구가 새로 추가되면 remaining_issues에 포함하세요.
+6. "필수 수정안 없음"인 경우, 원래 반려 사유가 비어 있다면 verification_passed를 true로 판단하세요.
+7. 수정안이 실제 수행 여부를 확인할 수 없는 내용을 "제공하였다", "충족하였다"처럼 단정하면 remaining_issues에 포함하세요.
 
-아래 JSON 형식으로만 응답하세요.
+[출력 형식]
+아래 JSON 형식으로만 응답하세요. 다른 텍스트는 절대 포함하지 마세요.
 
 {{
-    "verification_passed": true | false,
+    "verification_passed": true,
     "verification_result": "검증 결과 상세 설명",
     "remaining_issues": ["잔존 위험 표현1", "잔존 위험 표현2"]
 }}
@@ -225,7 +524,14 @@ COMPARATOR_PROMPT = PromptTemplate.from_template("""
 [수정안 검증 결과]
 {verification_result}
 
-아래 JSON 형식으로만 응답하세요.
+[비교 원칙]
+1. 원문 위반 사항이 없고 수정안이 "필수 수정안 없음"이면 원문과 수정안 리스크를 모두 "낮음"으로 판단하세요.
+2. 수정안이 위험 표현을 제거했다면 수정안 리스크를 원문보다 낮게 판단하세요.
+3. 수정안이 원문에 없는 사실이나 절차를 단정했다면 수정안 리스크를 낮게 평가하지 마세요.
+4. 리스크 비교는 과장하지 말고, 실제 반려 사유와 검증 결과에 근거해서 작성하세요.
+
+[출력 형식]
+아래 JSON 형식으로만 응답하세요. 다른 텍스트는 절대 포함하지 마세요.
 
 {{
     "original_risk_score": "높음 | 보통 | 낮음",
@@ -250,13 +556,29 @@ REPORT_PROMPT = PromptTemplate.from_template("""
 
 [문서 유형] {content_type} / [상품 유형] {product_type}
 
-[반려 가능성] {rejection_probability}
+[반려 가능성]
+{rejection_probability}
+
+[Knowledge Graph 판단 경로]
+{kg_traversal_path}
 
 [위반 가능 조항]
 {violation_articles}
 
+[정규화된 근거 조항]
+{evidence_articles}
+
 [반려 예상 사유]
 {rejection_reasons}
+
+[안전 요소]
+{safe_factors}
+
+[추가 확인 필요 사항]
+{additional_checks}
+
+[필요 고지사항]
+{required_disclosures}
 
 [원문]
 {input_text}
@@ -274,7 +596,43 @@ REPORT_PROMPT = PromptTemplate.from_template("""
 {law_context}
 
 [보고서 작성 지시사항]
-준법팀 담당자가 바로 활용할 수 있도록 명확하고 구조적으로 작성하세요.
+1. 준법팀 담당자가 바로 활용할 수 있도록 명확하고 구조적으로 작성하세요.
+2. 판단은 반드시 "현재 입력 문구 기준"의 사전 검토 의견으로 작성하세요.
+3. 전체 상품설명서, 약관, 최종 광고물, 실제 판매 방식에 따라 판단이 달라질 수 있으면 반드시 "추가 확인 필요 사항"에 분리해서 작성하세요.
+4. additional_checks는 위반 가능 사항이 아닙니다. 반드시 "추가 확인 필요 사항"으로 분리해서 작성하세요.
+5. safe_factors가 있으면 "안전 요소" 항목에 작성하세요.
+6. 반려 가능성이 "낮음"이면 "위반 가능 사항"에는 "명백한 위반 가능 사항 없음"이라고 작성하세요.
+7. 반려 가능성이 "낮음"이고 수정안이 없거나 "필수 수정안 없음"이면, 수정안 항목에는 "필수 수정안 없음"이라고 작성하세요.
+8. 반려 가능성이 "보통" 또는 "높음"인 경우에만 위반 가능 사항과 수정 전후 리스크 비교를 강조하세요.
+
+[법령·조문 사용 제한]
+9. 관련 법령은 [정규화된 근거 조항], [위반 가능 조항], [관련 법령], [Knowledge Graph 판단 경로]에 제공된 조항만 사용하세요.
+10. 제공되지 않은 법령명, 조문번호, 조문 제목을 새로 만들지 마세요.
+11. 법령명, 조문번호, 조문 제목은 제공된 문자열을 그대로 사용하세요.
+12. 괄호 안 조문 제목을 임의로 요약하거나 새로 붙이지 마세요.
+13. 조문 제목이 제공되지 않은 경우에는 괄호 제목을 만들지 말고, 법령명과 조문번호만 작성하세요.
+14. 예를 들어 제공된 근거에 없는 "금융소비자보호법 제26조(손실 가능성 고지)" 같은 표현을 임의로 생성하면 안 됩니다.
+15. [Knowledge Graph 판단 경로]는 판단 경로로만 제시하세요. 경로 안의 의미를 조문 제목으로 변환하거나 재명명하지 마세요.
+16. [관련 법령]의 본문 내용이 길더라도, 조문 제목을 새로 추론하지 말고 제공된 metadata 또는 문자열에 있는 제목만 사용하세요.
+
+[근거 분류 기준]
+17. [정규화된 근거 조항]은 이미 코드에서 핵심/보조/2차 확장/상품유형 참고 조항으로 분류된 근거입니다. 이 분류를 유지하세요.
+18. "핵심 근거 조항"은 입력 문구의 위험표현 또는 위험유형과 직접 연결된 조항입니다.
+19. "보조 검토 조항"은 SUPPLEMENTS 관계 등으로 연결된 보조 근거입니다. 곧바로 위반 확정 조항처럼 표현하지 마세요.
+20. "2차 KG 확장 조항"은 검색된 조문을 seed로 하여 하위규정, 보완조문, 필요고지사항을 확장한 결과입니다. 판단 보강 또는 추가 확인 필요 사항으로만 제시하세요.
+21. "상품유형 참고 조항"은 APPLIES_TO 관계로 확인된 상품군 관련 참고 조항입니다. 그 자체로 위반 근거라고 단정하지 마세요.
+22. [Knowledge Graph 판단 경로]는 1차 KG 탐색 경로와 2차 KG 확장 경로를 구분해서 제시하세요.
+23. 필요 고지사항은 상품유형과 입력 문구에 실제로 맞는 항목만 제시하세요.
+    - 일반 보장성 보험에는 수익률 변동 고지, 금융투자상품 운용 손실 고지, 투자성과 관련 고지를 제시하지 마세요.
+    - 단, 변액보험/투자연계보험/운용실적연동형 보험이 입력 텍스트에 명시된 경우에는 예외입니다.
+24. 위반 여부는 단정하지 말고 "위반 가능성", "반려 가능성", "검토 필요"의 표현을 사용하세요.
+
+[수정안 작성 기준]
+25. 수정안이 있는 경우, 원문의 위험 표현이 어떻게 완화되었는지 설명하세요.
+26. 수정안에 필요한 고지사항이 반영되었으면 그 내용을 명확히 언급하세요.
+27. 수정안이 없는 경우에는 현재 문구의 리스크 수준과 추가 확인 필요 여부를 설명하세요.
+
+[보고서 형식]
 아래 형식을 반드시 따르세요.
 
 ## 준법 사전 검토 보고서
@@ -284,21 +642,41 @@ REPORT_PROMPT = PromptTemplate.from_template("""
 - 상품 유형:
 - 반려 가능성:
 
-### 2. 위반 가능 사항
-(위반 조항과 사유를 조문 근거와 함께 서술)
+### 2. 검토 결과
+- 위반 가능 사항:
+- 안전 요소:
+- 추가 확인 필요 사항:
 
 ### 3. 원문
 (원문 텍스트)
 
 ### 4. 수정안
-(수정안 텍스트)
+(수정안 텍스트 또는 필수 수정안 없음)
 
 ### 5. 수정 전후 리스크 비교
-(원문 리스크 → 수정안 리스크)
+(수정안이 있는 경우: 원문 리스크 → 수정안 리스크)
+(수정안이 없는 경우: 현재 문구의 리스크 수준과 그 이유)
 
-### 6. 근거 법령
-(핵심 조문 목록)
+### 6. 근거 법령 및 판단 경로
+
+#### 6-1. 핵심 근거 조항
+([정규화된 근거 조항]의 [핵심 근거 조항]을 문자열 그대로 나열)
+
+#### 6-2. 보조 검토 조항
+([정규화된 근거 조항]의 [보조 검토 조항]을 문자열 그대로 나열)
+
+#### 6-3. 2차 KG 확장 조항
+([정규화된 근거 조항]의 [2차 KG 확장 조항]을 문자열 그대로 나열. 단, 위반 확정 조항으로 단정하지 말 것)
+
+#### 6-4. 상품유형 참고 조항
+([정규화된 근거 조항]의 [상품유형 참고 조항]을 문자열 그대로 나열. 필요 시 생략 가능)
+
+#### 6-5. 필요 고지사항
+([필요 고지사항]에 제공된 항목만 문자열 그대로 제시. [필요 고지사항]이 "없음" 또는 "현재 문구에 기본 안전 고지 포함"이면 그 내용을 그대로 작성)
+                                             
+#### 6-6. Knowledge Graph 탐색 경로
+([Knowledge Graph 판단 경로]를 조문명으로 재작성하지 말고, 판단 경로로 제시)
 
 ### 7. 검토 의견
-(담당자를 위한 최종 의견)
+(담당자를 위한 최종 의견. 현재 입력 문구 기준 판단과 전체 상품설명서/최종 광고물 기준 추가 확인 필요 여부를 구분)
 """)

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 
 from config.settings import get_llm
 from server.workflow.state import ComplianceState
@@ -26,17 +27,20 @@ class BaseAgent:
 
     def _parse_json(self, text: str) -> dict:
         text = text.strip()
-        if "```" in text:
-            text = text.split("```")[1]
-            if text.startswith("json"):
-                text = text[4:]
+
+        # 코드블록 제거
+        match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
+        if match:
+            text = match.group(1)
+
         try:
             return json.loads(text.strip())
-        except Exception:
+        except json.JSONDecodeError as e:
+            logger.warning("[BaseAgent] JSON 파싱 실패: %s | 원문: %.200s", e, text)
             return {}
 
     def _add_message(self, state: ComplianceState, node: str, content: str) -> list:
-        messages = state.get("messages", [])
+        messages = list(state.get("messages", []))
         return messages + [{"node": node, "content": content}]
 
     def run(self, state: ComplianceState) -> dict:
